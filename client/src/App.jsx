@@ -1,7 +1,8 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import './App.css';
+import { supabase } from './supabaseClient';
+import { getCurrentSchedule, getAllSchedule } from './schedule';
 
-const API = import.meta.env.VITE_API_URL || '/api';
 const EDIT_PASSWORD = 'ferdiberak';
 
 /* ─── Icons ──────────────────────────────────────────────────── */
@@ -76,12 +77,20 @@ function EyeIcon({ off }) {
     </svg>
   );
 }
-function ResetIcon() {
+function TrashIcon() {
   return (
     <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24"
       fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
-      <path d="M3 3v5h5"/>
+      <polyline points="3 6 5 6 21 6"/>
+      <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+    </svg>
+  );
+}
+function PlusIcon() {
+  return (
+    <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24"
+      fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+      <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
     </svg>
   );
 }
@@ -153,106 +162,189 @@ function PasswordModal({ onSuccess, onClose }) {
   );
 }
 
-/* ─── Main App ───────────────────────────────────────────────── */
-export default function App() {
-  const [current, setCurrent] = useState(null);
-  const [allData, setAllData] = useState(null);
-  const [loading, setLoading] = useState(true);
-
-  // Date-based edit state (for overrides)
-  const [editingDate, setEditingDate] = useState(null); // weekStartIso string
-  const [editNames, setEditNames] = useState(['', '']);
-  const [saving, setSaving] = useState(false);
-  const [saveError, setSaveError] = useState('');
-
-  // Password modal
-  const [showPwModal, setShowPwModal] = useState(false);
-  const [pendingDate, setPendingDate] = useState(null);
-  const [pendingNames, setPendingNames] = useState(['', '']);
-
-  async function fetchData() {
-    try {
-      const [curRes, allRes] = await Promise.all([
-        fetch(`${API}/schedule/current`),
-        fetch(`${API}/schedule/all`),
-      ]);
-      setCurrent(await curRes.json());
-      setAllData(await allRes.json());
-    } catch (e) {
-      console.error('Failed to fetch data:', e);
-    } finally {
-      setLoading(false);
-    }
+/* ─── Confirm Delete Modal ───────────────────────────────────── */
+function ConfirmDeleteModal({ team, error, onConfirm, onCancel }) {
+  function handleBackdrop(e) {
+    if (e.target === e.currentTarget) onCancel();
   }
 
-  useEffect(() => { fetchData(); }, []);
+  return (
+    <div className="modal-backdrop" onClick={handleBackdrop}>
+      <div className="modal-card">
+        <button className="modal-close" onClick={onCancel} title="Close"><XIcon /></button>
+        <div className="modal-lock-icon"><TrashIcon /></div>
+        <h2 className="modal-title">Remove this team?</h2>
+        <p className="modal-desc">
+          <strong>{team.name1} &amp; {team.name2}</strong> will be removed from the rotation.
+          This applies immediately for everyone.
+        </p>
+        {error && <p className="modal-error">❌ {error}</p>}
+        <div className="modal-actions">
+          <button type="button" className="btn-cancel modal-btn-cancel" onClick={onConfirm}>
+            <TrashIcon /> Remove
+          </button>
+          <button type="button" className="btn-save modal-btn-confirm" onClick={onCancel}>
+            <XIcon /> Cancel
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
 
-  // Step 1: click Edit on a date card → show password modal
-  function requestEdit(date, names) {
-    setPendingDate(date);
-    setPendingNames([...names]);
+/* ─── Main App ───────────────────────────────────────────────── */
+export default function App() {
+  // Base rotation, shared by everyone via Supabase — no more per-date overrides.
+  const [teams, setTeams] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState('');
+
+  // Inline edit state for an existing team's names
+  const [editingTeamId, setEditingTeamId] = useState(null);
+  const [editNames, setEditNames] = useState(['', '']);
+  const [saveError, setSaveError] = useState('');
+
+  // Inline "add team" form
+  const [addingNew, setAddingNew] = useState(false);
+  const [newNames, setNewNames] = useState(['', '']);
+
+  // Password modal — gates edit / add / delete alike
+  const [showPwModal, setShowPwModal] = useState(false);
+  const [pendingAction, setPendingAction] = useState(null);
+
+  // Confirm-delete modal (shown after the password gate, for the delete action)
+  const [confirmDeleteTeam, setConfirmDeleteTeam] = useState(null);
+  const [deleteError, setDeleteError] = useState('');
+
+  async function loadTeams() {
+    setLoading(true);
+    setLoadError('');
+    const { data, error } = await supabase
+      .from('teams')
+      .select('*')
+      .order('position', { ascending: true });
+    if (error) {
+      setLoadError(error.message);
+    } else {
+      setTeams(data || []);
+    }
+    setLoading(false);
+  }
+
+  useEffect(() => { loadTeams(); }, []);
+
+  const current = useMemo(() => (teams.length ? getCurrentSchedule(teams) : null), [teams]);
+  const allData = useMemo(() => getAllSchedule(teams), [teams]);
+
+  // Step 1: click Edit/Delete/Add → show password modal
+  function requestEdit(team) {
+    setPendingAction({ type: 'edit', teamId: team.id, names: [team.name1, team.name2] });
+    setShowPwModal(true);
+  }
+  function requestAdd() {
+    setPendingAction({ type: 'add' });
+    setShowPwModal(true);
+  }
+  function requestDelete(team) {
+    if (teams.length <= 1) return; // guarded in the UI too — button is hidden
+    setPendingAction({ type: 'delete', teamId: team.id, name1: team.name1, name2: team.name2 });
     setShowPwModal(true);
   }
 
-  // Step 2: password correct → open edit form for that date
+  // Step 2: password correct → carry out the pending action
   function onPasswordSuccess() {
     setShowPwModal(false);
-    setEditingDate(pendingDate);
-    setEditNames([...pendingNames]);
-    setSaveError('');
+    const action = pendingAction;
+    setPendingAction(null);
+    if (!action) return;
+
+    if (action.type === 'edit') {
+      setEditingTeamId(action.teamId);
+      setEditNames([...action.names]);
+      setSaveError('');
+    } else if (action.type === 'add') {
+      setAddingNew(true);
+      setNewNames(['', '']);
+      setSaveError('');
+    } else if (action.type === 'delete') {
+      setDeleteError('');
+      setConfirmDeleteTeam({ id: action.teamId, name1: action.name1, name2: action.name2 });
+    }
   }
 
   function closeModal() {
     setShowPwModal(false);
-    setPendingDate(null);
-    setPendingNames(['', '']);
+    setPendingAction(null);
   }
 
   function cancelEdit() {
-    setEditingDate(null);
+    setEditingTeamId(null);
     setEditNames(['', '']);
     setSaveError('');
   }
 
-  // Save a one-time override for a specific Sunday date
-  async function saveOverride(date) {
+  function cancelAdd() {
+    setAddingNew(false);
+    setNewNames(['', '']);
+    setSaveError('');
+  }
+
+  // Edit an existing team's names — persists to Supabase, visible to everyone
+  async function saveEditedTeam(teamId) {
     if (editNames.some(n => !n.trim())) {
       setSaveError('Name cannot be empty.');
       return;
     }
-    setSaving(true);
-    setSaveError('');
-    try {
-      const res = await fetch(`${API}/override`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ date, names: editNames }),
-      });
-      if (!res.ok) {
-        const err = await res.json();
-        setSaveError(err.error || 'Failed to save.');
-        return;
-      }
-      await fetchData();
-      setEditingDate(null);
-    } catch (e) {
-      setSaveError('Could not connect to server.');
-    } finally {
-      setSaving(false);
+    const [name1, name2] = editNames.map(n => n.trim());
+    const { error } = await supabase.from('teams').update({ name1, name2 }).eq('id', teamId);
+    if (error) {
+      setSaveError(`Failed to save: ${error.message}`);
+      return;
     }
+    setTeams(prev => prev.map(t => (t.id === teamId ? { ...t, name1, name2 } : t)));
+    setEditingTeamId(null);
   }
 
-  // Remove override → revert to normal rotation for that date
-  async function resetOverride(date) {
-    try {
-      await fetch(`${API}/override/${date}`, { method: 'DELETE' });
-      await fetchData();
-    } catch (e) {
-      console.error('Reset failed:', e);
+  // Add a new team at the end of the rotation (week 6, 7, ...)
+  async function addTeam() {
+    if (newNames.some(n => !n.trim())) {
+      setSaveError('Name cannot be empty.');
+      return;
     }
+    const [name1, name2] = newNames.map(n => n.trim());
+    const position = teams.length ? Math.max(...teams.map(t => t.position)) + 1 : 1;
+    const { data, error } = await supabase
+      .from('teams')
+      .insert({ name1, name2, position })
+      .select()
+      .single();
+    if (error) {
+      setSaveError(`Failed to add team: ${error.message}`);
+      return;
+    }
+    setTeams(prev => [...prev, data].sort((a, b) => a.position - b.position));
+    setAddingNew(false);
+    setNewNames(['', '']);
   }
 
-  const slotLabels = ['Week 1', 'Week 2', 'Week 3', 'Week 4', 'Week 5'];
+  // Remove a team from the rotation — shortens the cycle for everyone.
+  // Called from the confirm-delete modal, after the password gate.
+  async function confirmDelete() {
+    if (!confirmDeleteTeam) return;
+    const { error } = await supabase.from('teams').delete().eq('id', confirmDeleteTeam.id);
+    if (error) {
+      setDeleteError(`Failed to remove team: ${error.message}`);
+      return;
+    }
+    setTeams(prev => prev.filter(t => t.id !== confirmDeleteTeam.id));
+    setConfirmDeleteTeam(null);
+    setDeleteError('');
+  }
+
+  function cancelDelete() {
+    setConfirmDeleteTeam(null);
+    setDeleteError('');
+  }
 
   if (loading) {
     return (
@@ -263,10 +355,27 @@ export default function App() {
     );
   }
 
+  if (loadError) {
+    return (
+      <div className="loading-screen">
+        <p>⚠️ Could not load schedule: {loadError}</p>
+        <p>Check VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY in client/.env.</p>
+      </div>
+    );
+  }
+
   return (
     <div className="app">
       {showPwModal && (
         <PasswordModal onSuccess={onPasswordSuccess} onClose={closeModal} />
+      )}
+      {confirmDeleteTeam && (
+        <ConfirmDeleteModal
+          team={confirmDeleteTeam}
+          error={deleteError}
+          onConfirm={confirmDelete}
+          onCancel={cancelDelete}
+        />
       )}
 
       {/* Header */}
@@ -289,10 +398,10 @@ export default function App() {
               {current.isToday ? '🧹 On Duty Today' : '📅 Up Next Sunday'}
             </div>
 
-            {editingDate === current.weekStartIso ? (
+            {editingTeamId === current.teamId ? (
               /* Hero edit mode */
               <div className="hero-edit-form">
-                <p className="hero-edit-label">Change duty for {current.dateRange}</p>
+                <p className="hero-edit-label">Change this team's names</p>
                 <div className="edit-inputs hero-edit-inputs">
                   <input
                     className="edit-input hero-edit-input"
@@ -311,10 +420,10 @@ export default function App() {
                 </div>
                 {saveError && <p className="save-error hero-save-error">{saveError}</p>}
                 <div className="edit-actions">
-                  <button className="btn-save" onClick={() => saveOverride(current.weekStartIso)} disabled={saving}>
-                    <CheckIcon /> {saving ? 'Saving...' : 'Save'}
+                  <button className="btn-save" onClick={() => saveEditedTeam(current.teamId)}>
+                    <CheckIcon /> Save
                   </button>
-                  <button className="btn-cancel" onClick={cancelEdit} disabled={saving}>
+                  <button className="btn-cancel" onClick={cancelEdit}>
                     <XIcon /> Cancel
                   </button>
                 </div>
@@ -333,20 +442,9 @@ export default function App() {
                     {current.isToday ? 'Today' : current.dateRange}
                   </span>
                   <span className="hero-meta-item hero-slot-badge">
-                    Slot {current.slot} of 5
+                    Slot {current.index + 1} of {teams.length}
                   </span>
                 </div>
-
-                {/* Override info banner */}
-                {current.isOverridden && (
-                  <div className="override-banner">
-                    ✏️ Temporarily changed — normally{' '}
-                    <strong>{current.originalNames[0]} &amp; {current.originalNames[1]}</strong>
-                    <button className="btn-reset-banner" onClick={() => resetOverride(current.weekStartIso)}>
-                      <ResetIcon /> Reset to rotation
-                    </button>
-                  </div>
-                )}
 
                 {!current.isToday && current.lastNames && (
                   <p className="hero-note">
@@ -357,47 +455,119 @@ export default function App() {
                 {/* Edit button at bottom of hero */}
                 <button
                   className="btn-hero-edit"
-                  onClick={() => requestEdit(current.weekStartIso, current.names)}
+                  onClick={() => requestEdit({ id: current.teamId, name1: current.names[0], name2: current.names[1] })}
                 >
-                  <PencilIcon /> Edit this Sunday
+                  <PencilIcon /> Edit this team
                 </button>
               </>
             )}
           </section>
         )}
 
-        {/* ── Rotation Table (read-only) ── */}
-        {allData && (
-          <section className="section">
-            <h2 className="section-title">
-              <UsersIcon /> Duty Rotation (5 Weeks)
-            </h2>
-            <div className="table-card">
-              {allData.schedule.map((entry) => {
-                const isCurrentSlot = entry.slot === allData.currentSlot;
-                return (
-                  <div key={entry.slot}
-                    className={`table-row ${isCurrentSlot ? 'table-row--active' : ''}`}>
-                    <div className="row-slot">
-                      <span className={`slot-pill ${isCurrentSlot ? 'slot-pill--active' : ''}`}>
-                        {slotLabels[entry.slot - 1]}
-                      </span>
-                      {isCurrentSlot && <span className="current-tag">Active</span>}
+        {/* ── Rotation Table (the base data — editable) ── */}
+        <section className="section">
+          <h2 className="section-title">
+            <UsersIcon /> Duty Rotation ({teams.length} {teams.length === 1 ? 'Week' : 'Weeks'})
+          </h2>
+          <div className="table-card">
+            {teams.map((team, idx) => {
+              const isCurrentSlot = idx === allData.currentIndex;
+              return (
+                <div key={team.id}
+                  className={`table-row ${isCurrentSlot ? 'table-row--active' : ''}`}>
+                  <div className="row-slot">
+                    <span className={`slot-pill ${isCurrentSlot ? 'slot-pill--active' : ''}`}>
+                      Week {idx + 1}
+                    </span>
+                    {isCurrentSlot && <span className="current-tag">Active</span>}
+                  </div>
+
+                  {editingTeamId === team.id ? (
+                    <div className="edit-inputs-compact">
+                      <input
+                        className="edit-input-sm"
+                        value={editNames[0]}
+                        onChange={e => setEditNames([e.target.value, editNames[1]])}
+                        placeholder="Name 1"
+                        autoFocus
+                      />
+                      <span className="edit-sep-sm">&amp;</span>
+                      <input
+                        className="edit-input-sm"
+                        value={editNames[1]}
+                        onChange={e => setEditNames([editNames[0], e.target.value])}
+                        placeholder="Name 2"
+                      />
+                      {saveError && <p className="save-error-sm">{saveError}</p>}
+                      <div className="edit-actions-compact">
+                        <button className="btn-save-sm" onClick={() => saveEditedTeam(team.id)}>
+                          <CheckIcon /> Save
+                        </button>
+                        <button className="btn-cancel-sm" onClick={cancelEdit}>
+                          <XIcon />
+                        </button>
+                      </div>
                     </div>
+                  ) : (
                     <div className="names-row">
                       <span className="names-text">
-                        {entry.names[0]} <span className="names-amp">&amp;</span> {entry.names[1]}
+                        {team.name1} <span className="names-amp">&amp;</span> {team.name2}
                       </span>
+                      <div className="upcoming-actions">
+                        <button className="btn-edit-sm" onClick={() => requestEdit(team)}>
+                          <PencilIcon /> Edit
+                        </button>
+                        {teams.length > 1 && (
+                          <button className="btn-delete-sm" onClick={() => requestDelete(team)}>
+                            <TrashIcon /> Remove
+                          </button>
+                        )}
+                      </div>
                     </div>
+                  )}
+                </div>
+              );
+            })}
+
+            {/* Add new team row */}
+            <div className="table-row table-row--add">
+              {addingNew ? (
+                <div className="edit-inputs-compact">
+                  <input
+                    className="edit-input-sm"
+                    value={newNames[0]}
+                    onChange={e => setNewNames([e.target.value, newNames[1]])}
+                    placeholder="Name 1"
+                    autoFocus
+                  />
+                  <span className="edit-sep-sm">&amp;</span>
+                  <input
+                    className="edit-input-sm"
+                    value={newNames[1]}
+                    onChange={e => setNewNames([newNames[0], e.target.value])}
+                    placeholder="Name 2"
+                  />
+                  {saveError && <p className="save-error-sm">{saveError}</p>}
+                  <div className="edit-actions-compact">
+                    <button className="btn-save-sm" onClick={addTeam}>
+                      <CheckIcon /> Save
+                    </button>
+                    <button className="btn-cancel-sm" onClick={cancelAdd}>
+                      <XIcon />
+                    </button>
                   </div>
-                );
-              })}
+                </div>
+              ) : (
+                <button className="btn-add-team" onClick={requestAdd}>
+                  <PlusIcon /> Add Team (Week {teams.length + 1})
+                </button>
+              )}
             </div>
-          </section>
-        )}
+          </div>
+        </section>
 
         {/* ── Upcoming Weeks ── */}
-        {allData && allData.upcoming && (
+        {allData && allData.upcoming.length > 0 && (
           <section className="section">
             <h2 className="section-title">
               <CalendarIcon /> Next 4 Weeks
@@ -405,12 +575,12 @@ export default function App() {
             <div className="upcoming-grid">
               {allData.upcoming.map((item, i) => (
                 <div key={i}
-                  className={`upcoming-card ${item.isOverridden ? 'upcoming-card--modified' : ''} ${editingDate === item.weekStartIso ? 'upcoming-card--editing' : ''}`}>
+                  className={`upcoming-card ${editingTeamId === item.teamId ? 'upcoming-card--editing' : ''}`}>
 
-                  {editingDate === item.weekStartIso ? (
+                  {editingTeamId === item.teamId ? (
                     /* Upcoming edit mode */
                     <>
-                      <div className="upcoming-week">Week {i + 2}</div>
+                      <div className="upcoming-week">Week {item.index + 1}</div>
                       <div className="edit-inputs-compact">
                         <input
                           className="edit-input-sm"
@@ -429,10 +599,10 @@ export default function App() {
                       </div>
                       {saveError && <p className="save-error-sm">{saveError}</p>}
                       <div className="edit-actions-compact">
-                        <button className="btn-save-sm" onClick={() => saveOverride(item.weekStartIso)} disabled={saving}>
-                          <CheckIcon /> {saving ? '…' : 'Save'}
+                        <button className="btn-save-sm" onClick={() => saveEditedTeam(item.teamId)}>
+                          <CheckIcon /> Save
                         </button>
-                        <button className="btn-cancel-sm" onClick={cancelEdit} disabled={saving}>
+                        <button className="btn-cancel-sm" onClick={cancelEdit}>
                           <XIcon />
                         </button>
                       </div>
@@ -441,24 +611,14 @@ export default function App() {
                   ) : (
                     /* Upcoming normal mode */
                     <>
-                      <div className="upcoming-week">Week {i + 2}</div>
+                      <div className="upcoming-week">Week {item.index + 1}</div>
                       <div className="upcoming-names">{item.names.join(' & ')}</div>
-                      {item.isOverridden && (
-                        <div className="override-pill">✏️ Modified</div>
-                      )}
                       <div className="upcoming-date">{item.dateRange}</div>
                       <div className="upcoming-actions">
                         <button className="btn-edit-sm"
-                          onClick={() => requestEdit(item.weekStartIso, item.names)}>
+                          onClick={() => requestEdit({ id: item.teamId, name1: item.names[0], name2: item.names[1] })}>
                           <PencilIcon /> Edit
                         </button>
-                        {item.isOverridden && (
-                          <button className="btn-reset-sm"
-                            onClick={() => resetOverride(item.weekStartIso)}
-                            title="Reset to rotation">
-                            <ResetIcon /> Reset
-                          </button>
-                        )}
                       </div>
                     </>
                   )}

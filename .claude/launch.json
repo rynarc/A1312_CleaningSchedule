@@ -4,7 +4,7 @@
     {
       "name": "jadwal-piket",
       "runtimeExecutable": "npm",
-      "runtimeArgs": ["run", "dev"],
+      "runtimeArgs": ["--prefix", "client", "run", "dev"],
       "port": 5173
     }
   ]
